@@ -1,62 +1,32 @@
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, render_template_string
 import requests
-from threading import Thread, Event
 import time
 import random
 import string
 import os
-import json
+from threading import Thread, Event
 
 app = Flask(__name__)
-app.debug = True
 
-# Create directories if they don't exist
+# Create uploads directory
 if not os.path.exists('uploads'):
     os.makedirs('uploads')
 
 # Global variables
 stop_events = {}
-threads = {}
-task_status = {}
+active_tasks = {}
 
-def get_page_access_token(user_token, page_id):
-    """Get page access token from user token"""
+def send_facebook_message(page_token, recipient_id, message):
+    """Send message using Facebook Graph API"""
     try:
-        url = f"https://graph.facebook.com/v22.0/me/accounts"
-        params = {'access_token': user_token}
-        response = requests.get(url, params=params)
-        
-        if response.status_code == 200:
-            pages = response.json().get('data', [])
-            for page in pages:
-                if page['id'] == page_id:
-                    return page['access_token']
-        return None
-    except Exception as e:
-        print(f"Error getting page token: {e}")
-        return None
-
-def test_token(access_token):
-    """Test if token is valid"""
-    try:
-        url = "https://graph.facebook.com/v22.0/me"
-        params = {'access_token': access_token}
-        response = requests.get(url, params=params)
-        return response.status_code == 200
-    except:
-        return False
-
-def send_message_simple(access_token, recipient_id, message):
-    """Simple message sending method"""
-    try:
-        url = "https://graph.facebook.com/v22.0/me/messages"
+        url = f"https://graph.facebook.com/v19.0/me/messages"
         
         payload = {
-            'recipient': json.dumps({'id': recipient_id}),
-            'message': json.dumps({'text': message}),
-            'access_token': access_token,
+            'recipient': f'{{"id":"{recipient_id}"}}',
+            'message': f'{{"text":"{message}"}}',
+            'access_token': page_token,
             'messaging_type': 'MESSAGE_TAG',
-            'tag': 'ISSUE_RESOLUTION'
+            'tag': 'CONFIRMED_EVENT_UPDATE'
         }
         
         headers = {
@@ -64,33 +34,27 @@ def send_message_simple(access_token, recipient_id, message):
         }
         
         response = requests.post(url, data=payload, headers=headers)
-        result = response.json()
         
         if response.status_code == 200:
             return True, "Message sent successfully"
         else:
-            error_msg = result.get('error', {}).get('message', 'Unknown error')
-            return False, error_msg
+            error_data = response.json()
+            return False, f"Failed: {error_data.get('error', {}).get('message', 'Unknown error')}"
             
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-def send_image_simple(access_token, recipient_id, image_url):
-    """Simple image sending method"""
+def send_facebook_image(page_token, recipient_id, image_url):
+    """Send image using Facebook Graph API"""
     try:
-        url = "https://graph.facebook.com/v22.0/me/messages"
+        url = f"https://graph.facebook.com/v19.0/me/messages"
         
         payload = {
-            'recipient': json.dumps({'id': recipient_id}),
-            'message': json.dumps({
-                'attachment': {
-                    'type': 'image',
-                    'payload': {'url': image_url, 'is_reusable': True}
-                }
-            }),
-            'access_token': access_token,
+            'recipient': f'{{"id":"{recipient_id}"}}',
+            'message': f'{{"attachment":{{"type":"image","payload":{{"url":"{image_url}","is_reusable":true}}}}}}',
+            'access_token': page_token,
             'messaging_type': 'MESSAGE_TAG',
-            'tag': 'ISSUE_RESOLUTION'
+            'tag': 'CONFIRMED_EVENT_UPDATE'
         }
         
         headers = {
@@ -98,218 +62,250 @@ def send_image_simple(access_token, recipient_id, image_url):
         }
         
         response = requests.post(url, data=payload, headers=headers)
-        result = response.json()
         
         if response.status_code == 200:
             return True, "Image sent successfully"
         else:
-            error_msg = result.get('error', {}).get('message', 'Unknown error')
-            return False, error_msg
+            error_data = response.json()
+            return False, f"Failed: {error_data.get('error', {}).get('message', 'Unknown error')}"
             
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-def upload_image_and_get_url(access_token, image_path):
-    """Upload image to Facebook and get URL"""
-    try:
-        # First method: Direct upload
-        upload_url = "https://graph.facebook.com/v22.0/me/message_attachments"
-        
-        with open(image_path, 'rb') as img_file:
-            files = {
-                'filedata': (os.path.basename(image_path), img_file, 'image/jpeg')
-            }
-            data = {
-                'access_token': access_token,
-                'message': '{"attachment_type":"image"}'
-            }
-            
-            response = requests.post(upload_url, files=files, data=data)
-            
-            if response.status_code == 200:
-                result = response.json()
-                attachment_id = result.get('attachment_id')
-                
-                # Get the URL from attachment
-                url = f"https://www.facebook.com/attachment/{attachment_id}"
-                return True, url
-            else:
-                return False, f"Upload failed: {response.text}"
-                
-    except Exception as e:
-        return False, f"Upload error: {str(e)}"
-
-def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_files, task_id):
-    """Main function to send messages and images"""
+def continuous_message_cycle(task_id, page_token, recipient_id, name_prefix, messages, image_urls, delay):
+    """Continuous cycle of message -> image -> message -> image"""
     stop_event = stop_events[task_id]
-    task_status[task_id] = {'running': True, 'sent_messages': 0, 'sent_images': 0}
-    
-    # Clean thread ID
-    clean_thread_id = thread_id.replace('t_', '') if thread_id.startswith('t_') else thread_id
-    
-    # Filter valid tokens
-    valid_tokens = []
-    for token in access_tokens:
-        token = token.strip()
-        if token and len(token) > 50:  # Basic token validation
-            if test_token(token):
-                valid_tokens.append(token)
-                print(f"✅ Valid token found: {token[:20]}...")
-            else:
-                print(f"❌ Invalid token: {token[:20]}...")
-        else:
-            print(f"❌ Invalid token format")
-    
-    if not valid_tokens:
-        print("❌ No valid tokens available!")
-        task_status[task_id]['running'] = False
-        return
-    
-    print(f"🚀 Starting task with {len(valid_tokens)} tokens, {len(messages)} messages, {len(image_files)} images")
-    
-    # Prepare image URLs (upload images first)
-    image_urls = []
-    if image_files:
-        print("📤 Uploading images...")
-        for token in valid_tokens[:1]:  # Use first token for uploads
-            for image_file in image_files:
-                image_path = os.path.join('uploads', image_file)
-                if os.path.exists(image_path):
-                    success, url = upload_image_and_get_url(token, image_path)
-                    if success:
-                        image_urls.append(url)
-                        print(f"✅ Image uploaded: {image_file}")
-                    else:
-                        print(f"❌ Image upload failed: {image_file}")
-            break  # Only use first token for uploads
-    
     cycle_count = 0
+    
+    print(f"🚀 Starting continuous cycle for task {task_id}")
+    print(f"📝 Messages: {len(messages)}")
+    print(f"🖼️ Images: {len(image_urls)}")
+    print(f"⏰ Delay: {delay} seconds")
     
     while not stop_event.is_set():
         cycle_count += 1
-        print(f"🔄 Starting cycle {cycle_count}")
+        print(f"\n🔄 Cycle {cycle_count} started...")
         
-        for message_index, message_text in enumerate(messages):
-            if stop_event.is_set():
-                break
-                
-            # Send message from each token
-            for token_index, token in enumerate(valid_tokens):
-                if stop_event.is_set():
-                    break
-                    
-                full_message = f"{mn} {message_text}"
-                success, result = send_message_simple(token, clean_thread_id, full_message)
-                
-                if success:
-                    task_status[task_id]['sent_messages'] += 1
-                    print(f"✅ [{task_status[task_id]['sent_messages']}] Message sent via Token {token_index + 1}: {full_message[:30]}...")
-                else:
-                    print(f"❌ Message failed (Token {token_index + 1}): {result}")
-                
-                time.sleep(time_interval)
+        # Send a message
+        if messages:
+            message_text = f"{name_prefix} {random.choice(messages)}"
+            success, result = send_facebook_message(page_token, recipient_id, message_text)
             
-            # Send image after each message if images available
-            if image_urls and not stop_event.is_set():
-                for token_index, token in enumerate(valid_tokens):
-                    if stop_event.is_set():
-                        break
-                        
-                    image_url = random.choice(image_urls)
-                    success, result = send_image_simple(token, clean_thread_id, image_url)
-                    
-                    if success:
-                        task_status[task_id]['sent_images'] += 1
-                        print(f"🖼️ [{task_status[task_id]['sent_images']}] Image sent via Token {token_index + 1}")
-                    else:
-                        print(f"❌ Image failed (Token {token_index + 1}): {result}")
-                    
-                    time.sleep(time_interval)
+            if success:
+                print(f"✅ Message sent: {message_text[:50]}...")
+                active_tasks[task_id]['sent_messages'] += 1
+            else:
+                print(f"❌ Message failed: {result}")
+            
+            time.sleep(delay)
+        
+        # Send an image
+        if image_urls and not stop_event.is_set():
+            image_url = random.choice(image_urls)
+            success, result = send_facebook_image(page_token, recipient_id, image_url)
+            
+            if success:
+                print(f"✅ Image sent: {image_url[:50]}...")
+                active_tasks[task_id]['sent_images'] += 1
+            else:
+                print(f"❌ Image failed: {result}")
+            
+            time.sleep(delay)
+        
+        # Update status
+        active_tasks[task_id]['status'] = f"Running - Cycle {cycle_count}"
+        active_tasks[task_id]['last_activity'] = time.time()
     
-    task_status[task_id]['running'] = False
     print(f"🛑 Task {task_id} stopped")
+    active_tasks[task_id]['status'] = "Stopped"
 
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def home():
+    if request.method == 'POST':
+        try:
+            # Get form data
+            page_token = request.form.get('page_token', '').strip()
+            recipient_id = request.form.get('recipient_id', '').strip()
+            name_prefix = request.form.get('name_prefix', '').strip()
+            delay = int(request.form.get('delay', '5'))
+            
+            # Validate required fields
+            if not all([page_token, recipient_id, name_prefix]):
+                return render_template_string('''
+                <div class="alert alert-danger">
+                    <h4>❌ Missing Required Fields</h4>
+                    <p>Please fill all required fields</p>
+                    <a href="/" class="btn btn-primary">← Go Back</a>
+                </div>
+                ''')
+            
+            # Handle messages
+            messages = []
+            messages_text = request.form.get('messages', '')
+            if messages_text:
+                messages = [msg.strip() for msg in messages_text.split('\n') if msg.strip()]
+            
+            # Handle images
+            image_urls = []
+            images_text = request.form.get('image_urls', '')
+            if images_text:
+                image_urls = [url.strip() for url in images_text.split('\n') if url.strip()]
+            
+            # Handle image uploads
+            uploaded_files = request.files.getlist('image_files')
+            for file in uploaded_files:
+                if file and file.filename:
+                    # Save file
+                    filename = f"{int(time.time())}_{file.filename}"
+                    filepath = os.path.join('uploads', filename)
+                    file.save(filepath)
+                    # For local files, we'll use a placeholder since Facebook needs public URLs
+                    # In production, you'd upload these to a CDN
+                    image_urls.append(f"https://via.placeholder.com/500/008000/FFFFFF?text=Image+{len(image_urls)+1}")
+            
+            # If no images provided, use default placeholder
+            if not image_urls:
+                image_urls = [
+                    "https://via.placeholder.com/500/FF0000/FFFFFF?text=Image+1",
+                    "https://via.placeholder.com/500/00FF00/FFFFFF?text=Image+2", 
+                    "https://via.placeholder.com/500/0000FF/FFFFFF?text=Image+3"
+                ]
+            
+            # If no messages provided, use defaults
+            if not messages:
+                messages = [
+                    "Hello! This is an automated message.",
+                    "How are you doing today?",
+                    "Just checking in with you!",
+                    "Hope you're having a great day!",
+                    "This message was sent automatically."
+                ]
+            
+            # Create task
+            task_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            stop_events[task_id] = Event()
+            
+            active_tasks[task_id] = {
+                'status': 'Starting...',
+                'sent_messages': 0,
+                'sent_images': 0,
+                'start_time': time.time(),
+                'last_activity': time.time()
+            }
+            
+            # Start the cycle in a separate thread
+            thread = Thread(
+                target=continuous_message_cycle,
+                args=(task_id, page_token, recipient_id, name_prefix, messages, image_urls, delay),
+                daemon=True
+            )
+            thread.start()
+            
+            return render_template_string('''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Task Started</title>
+                <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+                <style>
+                    body { background: #f8f9fa; padding: 20px; }
+                    .success-box { 
+                        background: white; 
+                        padding: 30px; 
+                        border-radius: 10px; 
+                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                        margin: 20px auto;
+                        max-width: 600px;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="success-box text-center">
+                    <div class="mb-4">
+                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#28a745" stroke-width="2">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                        </svg>
+                    </div>
+                    <h2 class="text-success mb-3">✅ Task Started Successfully!</h2>
+                    
+                    <div class="text-start mb-4">
+                        <p><strong>Task ID:</strong> <code>{{ task_id }}</code></p>
+                        <p><strong>Recipient ID:</strong> {{ recipient_id }}</p>
+                        <p><strong>Messages:</strong> {{ messages_count }}</p>
+                        <p><strong>Images:</strong> {{ images_count }}</p>
+                        <p><strong>Delay:</strong> {{ delay }} seconds</p>
+                    </div>
+                    
+                    <div class="alert alert-info">
+                        <strong>📝 Check your console for real-time logs!</strong><br>
+                        Messages and images are being sent in continuous cycle.
+                    </div>
+                    
+                    <div class="d-grid gap-2">
+                        <a href="/" class="btn btn-primary">← Start New Task</a>
+                        <a href="/status" class="btn btn-outline-secondary">📊 View Status</a>
+                    </div>
+                </div>
+            </body>
+            </html>
+            ''', task_id=task_id, recipient_id=recipient_id, 
+                messages_count=len(messages), images_count=len(image_urls), delay=delay)
+            
+        except Exception as e:
+            return render_template_string('''
+            <div class="alert alert-danger">
+                <h4>❌ Error</h4>
+                <p>{{ error }}</p>
+                <a href="/" class="btn btn-primary">← Go Back</a>
+            </div>
+            ''', error=str(e))
+    
+    # GET request - show the form
     return render_template_string('''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🚀 Facebook Message Bot - Legend Prince</title>
+    <title>🚀 Facebook Auto Messenger</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         :root {
             --primary: #667eea;
             --secondary: #764ba2;
-            --success: #28a745;
-            --danger: #dc3545;
         }
-        
         body {
             background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
             min-height: 100vh;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-        
         .glass-card {
             background: rgba(255, 255, 255, 0.95);
             backdrop-filter: blur(10px);
-            border-radius: 20px;
+            border-radius: 15px;
             border: 1px solid rgba(255, 255, 255, 0.2);
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
         }
-        
-        .header-gradient {
-            background: linear-gradient(45deg, var(--primary), var(--secondary));
-            color: white;
-        }
-        
-        .btn-gradient {
-            background: linear-gradient(45deg, var(--primary), var(--secondary));
-            border: none;
-            color: white;
-            font-weight: 600;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-gradient:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-        }
-        
         .form-control {
             border-radius: 10px;
             border: 2px solid #e9ecef;
             transition: all 0.3s ease;
         }
-        
         .form-control:focus {
             border-color: var(--primary);
             box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
         }
-        
-        .preview-img {
-            width: 80px;
-            height: 80px;
-            object-fit: cover;
+        .btn-primary {
+            background: linear-gradient(45deg, var(--primary), var(--secondary));
+            border: none;
             border-radius: 10px;
-            margin: 5px;
-            border: 2px solid var(--primary);
+            font-weight: 600;
+            padding: 12px;
         }
-        
-        .status-badge {
-            background: var(--success);
-            color: white;
-            padding: 5px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-        }
-        
         .feature-icon {
-            font-size: 2rem;
+            font-size: 2.5rem;
             color: var(--primary);
             margin-bottom: 1rem;
         }
@@ -317,142 +313,106 @@ def home():
 </head>
 <body>
     <div class="container py-5">
-        <!-- Header -->
-        <div class="text-center text-white mb-5">
-            <h1 class="display-4 fw-bold"><i class="fas fa-robot"></i> Facebook Message Bot</h1>
-            <p class="lead">Automatically send messages and images to Facebook conversations</p>
-        </div>
-
         <div class="row justify-content-center">
             <div class="col-lg-8">
+                <!-- Header -->
+                <div class="text-center text-white mb-5">
+                    <h1 class="display-4 fw-bold"><i class="fas fa-robot"></i> Facebook Auto Messenger</h1>
+                    <p class="lead">Send messages and images in continuous cycle</p>
+                </div>
+
+                <!-- Main Form -->
                 <div class="glass-card p-4 mb-4">
-                    <!-- Features -->
-                    <div class="row text-center mb-4">
-                        <div class="col-md-3">
-                            <div class="feature-icon">
-                                <i class="fas fa-comment-dots"></i>
-                            </div>
-                            <h6>Auto Messages</h6>
-                        </div>
-                        <div class="col-md-3">
-                            <div class="feature-icon">
-                                <i class="fas fa-image"></i>
-                            </div>
-                            <h6>Image Support</h6>
-                        </div>
-                        <div class="col-md-3">
-                            <div class="feature-icon">
-                                <i class="fas fa-bolt"></i>
-                            </div>
-                            <h6>Fast & Reliable</h6>
-                        </div>
-                        <div class="col-md-3">
-                            <div class="feature-icon">
-                                <i class="fas fa-shield-alt"></i>
-                            </div>
-                            <h6>Secure</h6>
-                        </div>
-                    </div>
-
-                    <!-- Main Form -->
-                    <form method="post" action="/start" enctype="multipart/form-data" id="mainForm">
-                        <!-- Token Section -->
-                        <div class="mb-4">
-                            <label class="form-label fw-bold">🔑 Access Tokens</label>
-                            <select class="form-select mb-3" name="tokenOption" id="tokenOption" onchange="toggleTokenInput()">
-                                <option value="single">Single Token</option>
-                                <option value="multiple">Multiple Tokens</option>
-                            </select>
-                            
-                            <div id="singleTokenInput">
-                                <input type="text" class="form-control" name="singleToken" 
-                                       placeholder="Enter Facebook Access Token (EAAB...)" required>
-                                <div class="form-text">
-                                    <i class="fas fa-info-circle"></i> Get token from 
-                                    <a href="https://developers.facebook.com/tools/explorer/" target="_blank">Facebook Graph API Explorer</a>
-                                </div>
-                            </div>
-                            
-                            <div id="tokenFileInput" style="display: none;">
-                                <input type="file" class="form-control" name="tokenFile" accept=".txt">
-                                <div class="form-text">
-                                    <i class="fas fa-file-alt"></i> Upload .txt file with one token per line
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Recipient Info -->
-                        <div class="mb-4">
-                            <label class="form-label fw-bold">👥 Recipient Information</label>
-                            <input type="text" class="form-control mb-3" name="threadId" 
-                                   placeholder="Recipient Facebook ID (e.g., 123456789)" required>
-                            <input type="text" class="form-control" name="kidx" 
-                                   placeholder="Your Name (will be added before each message)" required>
-                        </div>
-
-                        <!-- Timing -->
-                        <div class="mb-4">
-                            <label class="form-label fw-bold">⏰ Timing Settings</label>
-                            <input type="number" class="form-control" name="time" value="3" min="1" max="10" required>
-                            <div class="form-text">Delay in seconds between messages</div>
-                        </div>
-
-                        <!-- Messages File -->
-                        <div class="mb-4">
-                            <label class="form-label fw-bold">💬 Messages File</label>
-                            <input type="file" class="form-control" name="txtFile" accept=".txt" required>
-                            <div class="form-text">
-                                <i class="fas fa-file-text"></i> .txt file with one message per line
-                            </div>
-                        </div>
-
-                        <!-- Images -->
-                        <div class="mb-4">
-                            <label class="form-label fw-bold">🖼️ Images (Optional)</label>
-                            <input type="file" class="form-control" id="imageFiles" name="imageFiles" multiple accept="image/*">
-                            <div class="form-text">
-                                <i class="fas fa-images"></i> Select multiple images to send after each message
-                            </div>
-                            <div id="imagePreview" class="mt-3"></div>
-                        </div>
-
-                        <button type="submit" class="btn btn-gradient btn-lg w-100 py-3" id="submitBtn">
-                            <i class="fas fa-rocket"></i> START SENDING MESSAGES
-                        </button>
-                    </form>
-
-                    <!-- Stop Form -->
-                    <form method="post" action="/stop" class="mt-4">
+                    <form method="post" enctype="multipart/form-data">
+                        <!-- Page Token -->
                         <div class="mb-3">
-                            <label class="form-label fw-bold">🛑 Stop Task</label>
-                            <input type="text" class="form-control" name="taskId" placeholder="Enter Task ID to stop" required>
+                            <label class="form-label fw-bold">🔑 Page Access Token *</label>
+                            <input type="text" class="form-control" name="page_token" 
+                                   placeholder="EAABwzLixnjYBO..." required>
+                            <div class="form-text">
+                                Get from <a href="https://developers.facebook.com/tools/explorer/" target="_blank">Facebook Graph API Explorer</a>
+                            </div>
                         </div>
-                        <button type="submit" class="btn btn-danger w-100 py-2">
-                            <i class="fas fa-stop"></i> STOP TASK
+
+                        <!-- Recipient ID -->
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">👤 Recipient Facebook ID *</label>
+                            <input type="text" class="form-control" name="recipient_id" 
+                                   placeholder="123456789012345" required>
+                            <div class="form-text">The Facebook ID of the person you want to message</div>
+                        </div>
+
+                        <!-- Name Prefix -->
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">🏷️ Your Name Prefix *</label>
+                            <input type="text" class="form-control" name="name_prefix" 
+                                   placeholder="Legend Prince" required>
+                            <div class="form-text">This will be added before each message</div>
+                        </div>
+
+                        <!-- Delay -->
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">⏰ Delay Between Sends (seconds) *</label>
+                            <input type="number" class="form-control" name="delay" value="5" min="2" max="60" required>
+                            <div class="form-text">Time between each message/image send</div>
+                        </div>
+
+                        <!-- Messages -->
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">💬 Messages (One per line)</label>
+                            <textarea class="form-control" name="messages" rows="4" 
+                                      placeholder="Hello! This is message 1&#10;This is message 2&#10;Another message here"></textarea>
+                            <div class="form-text">Each line will be a separate message. If empty, default messages will be used.</div>
+                        </div>
+
+                        <!-- Image URLs -->
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">🖼️ Image URLs (One per line)</label>
+                            <textarea class="form-control" name="image_urls" rows="3" 
+                                      placeholder="https://example.com/image1.jpg&#10;https://example.com/image2.png"></textarea>
+                            <div class="form-text">Public image URLs. If empty, placeholder images will be used.</div>
+                        </div>
+
+                        <!-- Image Upload -->
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">📤 Upload Images</label>
+                            <input type="file" class="form-control" name="image_files" multiple accept="image/*">
+                            <div class="form-text">Select multiple images to upload (will use placeholder URLs)</div>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary w-100 py-3">
+                            <i class="fas fa-play-circle"></i> START CONTINUOUS CYCLE
                         </button>
                     </form>
                 </div>
 
-                <!-- Instructions -->
-                <div class="glass-card p-4">
-                    <h5 class="fw-bold mb-3"><i class="fas fa-book"></i> How to Use:</h5>
-                    <ol>
-                        <li>Get Facebook Access Token from Graph API Explorer</li>
-                        <li>Enter recipient's Facebook ID</li>
-                        <li>Upload messages file (.txt format)</li>
-                        <li>Add images if needed (optional)</li>
-                        <li>Set delay time and click START</li>
-                        <li>Use Task ID to stop when needed</li>
-                    </ol>
-                    
-                    <div class="alert alert-info">
-                        <i class="fas fa-lightbulb"></i> 
-                        <strong>Pro Tip:</strong> Use Page Access Tokens for better reliability
+                <!-- Features -->
+                <div class="row text-center text-white mb-4">
+                    <div class="col-md-4">
+                        <div class="feature-icon">
+                            <i class="fas fa-sync-alt"></i>
+                        </div>
+                        <h5>Continuous Cycle</h5>
+                        <p>Message → Image → Message → Image</p>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="feature-icon">
+                            <i class="fas fa-infinity"></i>
+                        </div>
+                        <h5>Non-Stop</h5>
+                        <p>Runs until manually stopped</p>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="feature-icon">
+                            <i class="fas fa-bolt"></i>
+                        </div>
+                        <h5>Fast & Reliable</h5>
+                        <p>Uses Facebook Graph API</p>
                     </div>
                 </div>
 
                 <!-- Footer -->
-                <div class="text-center text-white mt-4">
+                <div class="text-center text-white">
                     <p>© 2024 Developed by <strong>Legend Prince</strong></p>
                     <div>
                         <a href="https://www.facebook.com/100064267823693" class="text-white me-3">
@@ -468,209 +428,40 @@ def home():
     </div>
 
     <script>
-        function toggleTokenInput() {
-            const option = document.getElementById('tokenOption').value;
-            document.getElementById('singleTokenInput').style.display = 
-                option === 'single' ? 'block' : 'none';
-            document.getElementById('tokenFileInput').style.display = 
-                option === 'multiple' ? 'block' : 'none';
+        // Simple form validation
+        document.querySelector('form').addEventListener('submit', function(e) {
+            const requiredFields = this.querySelectorAll('[required]');
+            let valid = true;
             
-            // Update required attributes
-            document.querySelector('[name="singleToken"]').required = option === 'single';
-            document.querySelector('[name="tokenFile"]').required = option === 'multiple';
-        }
-
-        // Image preview
-        document.getElementById('imageFiles').addEventListener('change', function(e) {
-            const preview = document.getElementById('imagePreview');
-            preview.innerHTML = '';
-            
-            Array.from(this.files).forEach(file => {
-                if (file.type.startsWith('image/')) {
-                    const reader = new FileReader();
-                    reader.onload = function(e) {
-                        const img = document.createElement('img');
-                        img.src = e.target.result;
-                        img.className = 'preview-img';
-                        preview.appendChild(img);
-                    }
-                    reader.readAsDataURL(file);
+            requiredFields.forEach(field => {
+                if (!field.value.trim()) {
+                    valid = false;
+                    field.style.borderColor = '#dc3545';
+                } else {
+                    field.style.borderColor = '';
                 }
             });
-        });
-
-        // Form submission
-        document.getElementById('mainForm').addEventListener('submit', function() {
-            const btn = document.getElementById('submitBtn');
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> STARTING...';
-            btn.disabled = true;
-        });
-
-        // Initialize
-        document.addEventListener('DOMContentLoaded', function() {
-            toggleTokenInput();
+            
+            if (!valid) {
+                e.preventDefault();
+                alert('Please fill all required fields marked with *');
+            }
         });
     </script>
 </body>
 </html>
 ''')
 
-@app.route('/start', methods=['POST'])
-def start_task():
-    try:
-        # Get form data
-        token_option = request.form.get('tokenOption', 'single')
-        
-        # Handle tokens
-        if token_option == 'single':
-            single_token = request.form.get('singleToken', '').strip()
-            access_tokens = [single_token] if single_token else []
-        else:
-            token_file = request.files.get('tokenFile')
-            if token_file and token_file.filename:
-                access_tokens = token_file.read().decode('utf-8').strip().split('\n')
-                access_tokens = [t.strip() for t in access_tokens if t.strip()]
-            else:
-                access_tokens = []
-        
-        if not access_tokens:
-            return '''
-            <div class="alert alert-danger text-center">
-                <h4>❌ Error</h4>
-                <p>Please provide valid access tokens</p>
-                <a href="/" class="btn btn-primary">← Go Back</a>
-            </div>
-            '''
-        
-        # Get other data
-        thread_id = request.form.get('threadId', '').strip()
-        if not thread_id:
-            return '''
-            <div class="alert alert-danger text-center">
-                <h4>❌ Error</h4>
-                <p>Please provide Recipient ID</p>
-                <a href="/" class="btn btn-primary">← Go Back</a>
-            </div>
-            '''
-        
-        kidx = request.form.get('kidx', '').strip()
-        if not kidx:
-            return '''
-            <div class="alert alert-danger text-center">
-                <h4>❌ Error</h4>
-                <p>Please provide your name</p>
-                <a href="/" class="btn btn-primary">← Go Back</a>
-            </div>
-            '''
-        
-        try:
-            time_interval = max(1, min(10, int(request.form.get('time', 3))))
-        except:
-            time_interval = 3
-        
-        # Handle messages file
-        txt_file = request.files.get('txtFile')
-        if not txt_file or not txt_file.filename:
-            return '''
-            <div class="alert alert-danger text-center">
-                <h4>❌ Error</h4>
-                <p>Please provide a messages file</p>
-                <a href="/" class="btn btn-primary">← Go Back</a>
-            </div>
-            '''
-        
-        messages = txt_file.read().decode('utf-8').strip().split('\n')
-        messages = [m.strip() for m in messages if m.strip()]
-        
-        if not messages:
-            return '''
-            <div class="alert alert-danger text-center">
-                <h4>❌ Error</h4>
-                <p>No valid messages found in the file</p>
-                <a href="/" class="btn btn-primary">← Go Back</a>
-            </div>
-            '''
-        
-        # Handle images
-        image_files = []
-        uploaded_images = request.files.getlist('imageFiles')
-        for image in uploaded_images:
-            if image and image.filename:
-                filename = f"{int(time.time())}_{random.randint(1000,9999)}_{image.filename}"
-                filepath = os.path.join('uploads', filename)
-                image.save(filepath)
-                image_files.append(filename)
-        
-        # Create task
-        task_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        stop_events[task_id] = Event()
-        
-        # Start thread
-        thread = Thread(
-            target=send_messages,
-            args=(access_tokens, thread_id, kidx, time_interval, messages, image_files, task_id),
-            daemon=True
-        )
-        threads[task_id] = thread
-        thread.start()
-        
-        return f'''
-        <div class="container py-5">
-            <div class="glass-card p-5 text-center">
-                <div class="mb-4">
-                    <i class="fas fa-check-circle text-success" style="font-size: 4rem;"></i>
-                </div>
-                <h2 class="text-success mb-4">✅ Task Started Successfully!</h2>
-                
-                <div class="row text-start mb-4">
-                    <div class="col-md-6">
-                        <p><strong>Task ID:</strong> <code>{task_id}</code></p>
-                        <p><strong>Tokens:</strong> {len(access_tokens)}</p>
-                        <p><strong>Messages:</strong> {len(messages)}</p>
-                    </div>
-                    <div class="col-md-6">
-                        <p><strong>Images:</strong> {len(image_files)}</p>
-                        <p><strong>Interval:</strong> {time_interval} seconds</p>
-                        <p><strong>Status:</strong> <span class="status-badge">RUNNING</span></p>
-                    </div>
-                </div>
-                
-                <div class="alert alert-info">
-                    <i class="fas fa-info-circle"></i>
-                    <strong>Keep this page open</strong> to see console logs. Use the Task ID to stop this task.
-                </div>
-                
-                <a href="/" class="btn btn-gradient btn-lg">
-                    <i class="fas fa-home"></i> Back to Home
-                </a>
-            </div>
-        </div>
-        '''
-        
-    except Exception as e:
-        return f'''
-        <div class="alert alert-danger text-center">
-            <h4>❌ Error</h4>
-            <p>{str(e)}</p>
-            <a href="/" class="btn btn-primary">← Go Back</a>
-        </div>
-        '''
-
 @app.route('/stop', methods=['POST'])
 def stop_task():
-    task_id = request.form.get('taskId', '').strip().upper()
+    task_id = request.form.get('task_id', '').strip()
     if task_id in stop_events:
         stop_events[task_id].set()
         time.sleep(1)
-        if task_id in threads:
-            del threads[task_id]
         if task_id in stop_events:
             del stop_events[task_id]
-        if task_id in task_status:
-            del task_status[task_id]
-        
         return '''
-        <div class="alert alert-success text-center">
+        <div class="alert alert-success">
             <h4>✅ Task Stopped</h4>
             <p>Task ''' + task_id + ''' has been stopped successfully!</p>
             <a href="/" class="btn btn-primary">← Go Back</a>
@@ -678,21 +469,66 @@ def stop_task():
         '''
     else:
         return '''
-        <div class="alert alert-warning text-center">
+        <div class="alert alert-warning">
             <h4>⚠️ Task Not Found</h4>
             <p>Task ''' + task_id + ''' not found or already stopped</p>
             <a href="/" class="btn btn-primary">← Go Back</a>
         </div>
         '''
 
-@app.route('/status/<task_id>')
-def get_status(task_id):
-    if task_id in task_status:
-        return jsonify(task_status[task_id])
+@app.route('/status')
+def status_page():
+    status_html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Task Status</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+        <style>
+            body { background: #f8f9fa; padding: 20px; }
+            .status-card { background: white; border-radius: 10px; padding: 20px; margin: 10px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1 class="text-center mb-4">📊 Active Tasks Status</h1>
+    '''
+    
+    if active_tasks:
+        for task_id, task_info in active_tasks.items():
+            status_html += f'''
+            <div class="status-card">
+                <h4>Task: {task_id}</h4>
+                <p><strong>Status:</strong> {task_info['status']}</p>
+                <p><strong>Messages Sent:</strong> {task_info['sent_messages']}</p>
+                <p><strong>Images Sent:</strong> {task_info['sent_images']}</p>
+                <form method="post" action="/stop" style="display: inline;">
+                    <input type="hidden" name="task_id" value="{task_id}">
+                    <button type="submit" class="btn btn-danger btn-sm">Stop</button>
+                </form>
+            </div>
+            '''
     else:
-        return jsonify({'error': 'Task not found'})
+        status_html += '''
+        <div class="alert alert-info text-center">
+            <h4>No Active Tasks</h4>
+            <p>No tasks are currently running.</p>
+        </div>
+        '''
+    
+    status_html += '''
+            <div class="text-center mt-4">
+                <a href="/" class="btn btn-primary">← Back to Home</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    
+    return status_html
 
 if __name__ == '__main__':
-    print("🚀 Facebook Message Bot Starting...")
-    print("📧 Server running on http://0.0.0.0:5000")
+    print("🚀 Facebook Auto Messenger Started!")
+    print("📍 Server running on: http://localhost:5000")
+    print("💡 Visit the URL above in your browser to start")
     app.run(host='0.0.0.0', port=5000, debug=True)
