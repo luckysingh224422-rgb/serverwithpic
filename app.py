@@ -4,10 +4,15 @@ from threading import Thread, Event
 import time
 import random
 import string
+import base64
 import os
  
 app = Flask(__name__)
 app.debug = True
+ 
+# Create uploads directory if it doesn't exist
+if not os.path.exists('uploads'):
+    os.makedirs('uploads')
  
 headers = {
     'Connection': 'keep-alive',
@@ -24,8 +29,48 @@ headers = {
 stop_events = {}
 threads = {}
  
-def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_urls, task_id):
+def upload_image_to_fb(access_token, image_path, thread_id):
+    """Upload image to Facebook and return attachment ID"""
+    try:
+        # First upload the image
+        upload_url = 'https://graph.facebook.com/v15.0/me/message_attachments'
+        files = {
+            'filedata': (os.path.basename(image_path), open(image_path, 'rb'), 'image/jpeg')
+        }
+        data = {
+            'access_token': access_token,
+            'message': '{"attachment_type":"image"}'
+        }
+        
+        response = requests.post(upload_url, files=files, data=data)
+        if response.status_code == 200:
+            attachment_id = response.json().get('attachment_id')
+            return attachment_id
+        else:
+            print(f"Image upload failed: {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error uploading image: {e}")
+        return None
+
+def send_image_attachment(access_token, thread_id, attachment_id):
+    """Send message with image attachment"""
+    try:
+        api_url = f'https://graph.facebook.com/v15.0/t_{thread_id}/'
+        data = {
+            'access_token': access_token,
+            'message': ' ',
+            'attachment_id': attachment_id
+        }
+        response = requests.post(api_url, data=data)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Error sending image: {e}")
+        return False
+
+def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_files, task_id):
     stop_event = stop_events[task_id]
+    
     while not stop_event.is_set():
         for i, message1 in enumerate(messages):
             if stop_event.is_set():
@@ -46,26 +91,29 @@ def send_messages(access_tokens, thread_id, mn, time_interval, messages, image_u
                     print(f"Message Sent Failed From token {access_token}: {message}")
                 time.sleep(time_interval)
             
-            # Send image after each message if image URLs are provided
-            if image_urls and not stop_event.is_set():
+            # Send image after each message if image files are provided
+            if image_files and not stop_event.is_set():
                 for access_token in access_tokens:
                     if stop_event.is_set():
                         break
                         
-                    # Select random image or cycle through images
-                    image_url = random.choice(image_urls) if image_urls else None
-                    if image_url:
-                        api_url = f'https://graph.facebook.com/v15.0/t_{thread_id}/'
-                        parameters = {
-                            'access_token': access_token,
-                            'message': ' ',  # Empty message or you can add something
-                            'attachment_url': image_url
-                        }
-                        response = requests.post(api_url, data=parameters, headers=headers)
-                        if response.status_code == 200:
-                            print(f"Image Sent Successfully From token {access_token}: {image_url}")
+                    # Select random image
+                    image_file = random.choice(image_files)
+                    image_path = os.path.join('uploads', image_file)
+                    
+                    if os.path.exists(image_path):
+                        # Upload image and get attachment ID
+                        attachment_id = upload_image_to_fb(access_token, image_path, thread_id)
+                        if attachment_id:
+                            # Send image using attachment ID
+                            success = send_image_attachment(access_token, thread_id, attachment_id)
+                            if success:
+                                print(f"Image Sent Successfully From token {access_token}: {image_file}")
+                            else:
+                                print(f"Image Sent Failed From token {access_token}: {image_file}")
                         else:
-                            print(f"Image Sent Failed From token {access_token}: {image_url}")
+                            print(f"Image Upload Failed From token {access_token}: {image_file}")
+                        
                         time.sleep(time_interval)
  
 @app.route('/', methods=['GET', 'POST'])
@@ -86,16 +134,21 @@ def send_message():
         txt_file = request.files['txtFile']
         messages = txt_file.read().decode().splitlines()
         
-        # Handle image URLs input
-        image_urls = []
-        image_urls_text = request.form.get('imageUrls', '')
-        if image_urls_text:
-            image_urls = [url.strip() for url in image_urls_text.split('\n') if url.strip()]
+        # Handle image files upload
+        image_files = []
+        uploaded_images = request.files.getlist('imageFiles')
+        for image in uploaded_images:
+            if image and image.filename:
+                # Save uploaded image
+                filename = f"{int(time.time())}_{image.filename}"
+                filepath = os.path.join('uploads', filename)
+                image.save(filepath)
+                image_files.append(filename)
  
         task_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
  
         stop_events[task_id] = Event()
-        thread = Thread(target=send_messages, args=(access_tokens, thread_id, mn, time_interval, messages, image_urls, task_id))
+        thread = Thread(target=send_messages, args=(access_tokens, thread_id, mn, time_interval, messages, image_files, task_id))
         threads[task_id] = thread
         thread.start()
  
@@ -142,9 +195,9 @@ def send_message():
       border-radius: 10px;
       color: white;
     }
-    .form-control-textarea {
-      height: 100px;
-      resize: vertical;
+    .form-control-file {
+      height: auto;
+      padding: 10px;
     }
     .header { text-align: center; padding-bottom: 20px; }
     .btn-submit { width: 100%; margin-top: 10px; }
@@ -161,6 +214,13 @@ def send_message():
       color: #ccc;
       margin-top: -15px;
       margin-bottom: 15px;
+    }
+    .image-preview {
+      max-width: 100px;
+      max-height: 100px;
+      margin: 5px;
+      border-radius: 5px;
+      border: 1px solid white;
     }
   </style>
 </head>
@@ -203,9 +263,10 @@ def send_message():
         <input type="file" class="form-control" id="txtFile" name="txtFile" required>
       </div>
       <div class="mb-3">
-        <label for="imageUrls" class="form-label">Enter Image URLs (One per line)</label>
-        <textarea class="form-control form-control-textarea" id="imageUrls" name="imageUrls" placeholder="Enter image URLs, one per line&#10;Example:&#10;https://example.com/image1.jpg&#10;https://example.com/image2.png"></textarea>
-        <div class="info-text">Leave empty if you don't want to send images</div>
+        <label for="imageFiles" class="form-label">Upload Images (Multiple)</label>
+        <input type="file" class="form-control form-control-file" id="imageFiles" name="imageFiles" multiple accept="image/*">
+        <div class="info-text">Select multiple images to send in message-image cycle</div>
+        <div id="imagePreview" class="mt-2"></div>
       </div>
       <button type="submit" class="btn btn-primary btn-submit">Run</button>
       </form>
@@ -237,6 +298,27 @@ def send_message():
         document.getElementById('tokenFileInput').style.display = 'block';
       }
     }
+    
+    // Image preview functionality
+    document.getElementById('imageFiles').addEventListener('change', function(e) {
+      const preview = document.getElementById('imagePreview');
+      preview.innerHTML = '';
+      
+      const files = e.target.files;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.type.startsWith('image/')) {
+          const reader = new FileReader();
+          reader.onload = function(e) {
+            const img = document.createElement('img');
+            img.src = e.target.result;
+            img.className = 'image-preview';
+            preview.appendChild(img);
+          }
+          reader.readAsDataURL(file);
+        }
+      }
+    });
     
     // Initialize on page load
     document.addEventListener('DOMContentLoaded', function() {
